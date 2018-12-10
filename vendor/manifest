@@ -132,6 +132,14 @@
 			"branch": "master",
 			"path": "/unicode/norm",
 			"notests": true
+		},
+		{
+			"importpath": "github.com/couchbase/vellum",
+			"repository": "https://github.com/couchbase/vellum",
+			"vcs": "git",
+			"revision": "f377ee3282b954c46915d89482bf93288ee7dd12",
+			"branch": "master",
+			"notests": true
 		}
 	]
 }

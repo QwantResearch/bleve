@@ -17,9 +17,11 @@ package scorch
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -35,16 +37,49 @@ import (
 
 var DefaultChunkFactor uint32 = 1024
 
-// Arbitrary number, need to make it configurable.
-// Lower values like 10/making persister really slow
-// doesn't work well as it is creating more files to
-// persist for in next persist iteration and spikes the # FDs.
-// Ideal value should let persister also proceed at
-// an optimum pace so that the merger can skip
-// many intermediate snapshots.
-// This needs to be based on empirical data.
-// TODO - may need to revisit this approach/value.
-var epochDistance = uint64(5)
+// DefaultPersisterNapTimeMSec is kept to zero as this helps in direct
+// persistence of segments with the default safe batch option.
+// If the default safe batch option results in high number of
+// files on disk, then users may initialise this configuration parameter
+// with higher values so that the persister will nap a bit within it's
+// work loop to favour better in-memory merging of segments to result
+// in fewer segment files on disk. But that may come with an indexing
+// performance overhead.
+// Unsafe batch users are advised to override this to higher value
+// for better performance especially with high data density.
+var DefaultPersisterNapTimeMSec int = 0 // ms
+
+// DefaultPersisterNapUnderNumFiles helps in controlling the pace of
+// persister. At times of a slow merger progress with heavy file merging
+// operations, its better to pace down the persister for letting the merger
+// to catch up within a range defined by this parameter.
+// Fewer files on disk (as per the merge plan) would result in keeping the
+// file handle usage under limit, faster disk merger and a healthier index.
+// Its been observed that such a loosely sync'ed introducer-persister-merger
+// trio results in better overall performance.
+var DefaultPersisterNapUnderNumFiles int = 1000
+
+var DefaultMemoryPressurePauseThreshold uint64 = math.MaxUint64
+
+type persisterOptions struct {
+	// PersisterNapTimeMSec controls the wait/delay injected into
+	// persistence workloop to improve the chances for
+	// a healthier and heavier in-memory merging
+	PersisterNapTimeMSec int
+
+	// PersisterNapTimeMSec > 0, and the number of files is less than
+	// PersisterNapUnderNumFiles, then the persister will sleep
+	// PersisterNapTimeMSec amount of time to improve the chances for
+	// a healthier and heavier in-memory merging
+	PersisterNapUnderNumFiles int
+
+	// MemoryPressurePauseThreshold let persister to have a better leeway
+	// for prudently performing the memory merge of segments on a memory
+	// pressure situation. Here the config value is an upper threshold
+	// for the number of paused application threads. The default value would
+	// be a very high number to always favour the merging of memory segments.
+	MemoryPressurePauseThreshold uint64
+}
 
 type notificationChan chan struct{}
 
@@ -54,6 +89,13 @@ func (s *Scorch) persisterLoop() {
 	var persistWatchers []*epochWatcher
 	var lastPersistedEpoch, lastMergedEpoch uint64
 	var ew *epochWatcher
+	po, err := s.parsePersisterOptions()
+	if err != nil {
+		s.fireAsyncError(fmt.Errorf("persisterOptions json parsing err: %v", err))
+		s.asyncTasks.Done()
+		return
+	}
+
 OUTER:
 	for {
 		atomic.AddUint64(&s.stats.TotPersistLoopBeg, 1)
@@ -69,7 +111,7 @@ OUTER:
 			lastMergedEpoch = ew.epoch
 		}
 		lastMergedEpoch, persistWatchers = s.pausePersisterForMergerCatchUp(lastPersistedEpoch,
-			lastMergedEpoch, persistWatchers)
+			lastMergedEpoch, persistWatchers, po)
 
 		var ourSnapshot *IndexSnapshot
 		var ourPersisted []chan error
@@ -89,7 +131,7 @@ OUTER:
 		if ourSnapshot != nil {
 			startTime := time.Now()
 
-			err := s.persistSnapshot(ourSnapshot)
+			err := s.persistSnapshot(ourSnapshot, po)
 			for _, ch := range ourPersisted {
 				if err != nil {
 					ch <- err
@@ -98,7 +140,7 @@ OUTER:
 			}
 			if err != nil {
 				atomic.StoreUint64(&s.iStats.persistEpoch, 0)
-				if err == ErrClosed {
+				if err == segment.ErrClosed {
 					// index has been closed
 					_ = ourSnapshot.DecRef()
 					break OUTER
@@ -180,14 +222,40 @@ func notifyMergeWatchers(lastPersistedEpoch uint64,
 }
 
 func (s *Scorch) pausePersisterForMergerCatchUp(lastPersistedEpoch uint64, lastMergedEpoch uint64,
-	persistWatchers []*epochWatcher) (uint64, []*epochWatcher) {
+	persistWatchers []*epochWatcher, po *persisterOptions) (uint64, []*epochWatcher) {
 
 	// first, let the watchers proceed if they lag behind
 	persistWatchers = notifyMergeWatchers(lastPersistedEpoch, persistWatchers)
 
+	// check the merger lag by counting the segment files on disk,
+	// On finding fewer files on disk, persister takes a short pause
+	// for sufficient in-memory segments to pile up for the next
+	// memory merge cum persist loop.
+	// On finding too many files on disk, persister pause until the merger
+	// catches up to reduce the segment file count under the threshold.
+	// But if there is memory pressure, then skip this sleep maneuvers.
+	numFilesOnDisk, _ := s.diskFileStats()
+	if numFilesOnDisk < uint64(po.PersisterNapUnderNumFiles) &&
+		po.PersisterNapTimeMSec > 0 && s.paused() == 0 {
+		select {
+		case <-s.closeCh:
+		case <-time.After(time.Millisecond * time.Duration(po.PersisterNapTimeMSec)):
+			atomic.AddUint64(&s.stats.TotPersisterNapPauseCompleted, 1)
+
+		case ew := <-s.persisterNotifier:
+			// unblock the merger in meantime
+			persistWatchers = append(persistWatchers, ew)
+			lastMergedEpoch = ew.epoch
+			persistWatchers = notifyMergeWatchers(lastPersistedEpoch, persistWatchers)
+			atomic.AddUint64(&s.stats.TotPersisterMergerNapBreak, 1)
+		}
+		return lastMergedEpoch, persistWatchers
+	}
+
 OUTER:
-	// check for slow merger and await until the merger catch up
-	for lastPersistedEpoch > lastMergedEpoch+epochDistance {
+	for po.PersisterNapUnderNumFiles > 0 &&
+		numFilesOnDisk >= uint64(po.PersisterNapUnderNumFiles) &&
+		lastMergedEpoch < lastPersistedEpoch {
 		atomic.AddUint64(&s.stats.TotPersisterSlowMergerPause, 1)
 
 		select {
@@ -202,18 +270,46 @@ OUTER:
 
 		// let the watchers proceed if they lag behind
 		persistWatchers = notifyMergeWatchers(lastPersistedEpoch, persistWatchers)
+
+		numFilesOnDisk, _ = s.diskFileStats()
 	}
 
 	return lastMergedEpoch, persistWatchers
 }
 
-func (s *Scorch) persistSnapshot(snapshot *IndexSnapshot) error {
-	persisted, err := s.persistSnapshotMaybeMerge(snapshot)
-	if err != nil {
-		return err
+func (s *Scorch) parsePersisterOptions() (*persisterOptions, error) {
+	po := persisterOptions{
+		PersisterNapTimeMSec:         DefaultPersisterNapTimeMSec,
+		PersisterNapUnderNumFiles:    DefaultPersisterNapUnderNumFiles,
+		MemoryPressurePauseThreshold: DefaultMemoryPressurePauseThreshold,
 	}
-	if persisted {
-		return nil
+	if v, ok := s.config["scorchPersisterOptions"]; ok {
+		b, err := json.Marshal(v)
+		if err != nil {
+			return &po, err
+		}
+
+		err = json.Unmarshal(b, &po)
+		if err != nil {
+			return &po, err
+		}
+	}
+	return &po, nil
+}
+
+func (s *Scorch) persistSnapshot(snapshot *IndexSnapshot,
+	po *persisterOptions) error {
+	// Perform in-memory segment merging only when the memory pressure is
+	// below the configured threshold, else the persister performs the
+	// direct persistence of segments.
+	if s.paused() < po.MemoryPressurePauseThreshold {
+		persisted, err := s.persistSnapshotMaybeMerge(snapshot)
+		if err != nil {
+			return err
+		}
+		if persisted {
+			return nil
+		}
 	}
 
 	return s.persistSnapshotDirect(snapshot)
@@ -436,15 +532,13 @@ func (s *Scorch) persistSnapshotDirect(snapshot *IndexSnapshot) (err error) {
 
 		select {
 		case <-s.closeCh:
-			err = ErrClosed
-			return err
+			return segment.ErrClosed
 		case s.persists <- persist:
 		}
 
 		select {
 		case <-s.closeCh:
-			err = ErrClosed
-			return err
+			return segment.ErrClosed
 		case <-persist.applied:
 		}
 	}
@@ -521,11 +615,14 @@ func (s *Scorch) loadFromBolt() error {
 			s.nextSegmentID++
 			s.rootLock.Lock()
 			s.nextSnapshotEpoch = snapshotEpoch + 1
-			if s.root != nil {
-				_ = s.root.DecRef()
-			}
+			rootPrev := s.root
 			s.root = indexSnapshot
 			s.rootLock.Unlock()
+
+			if rootPrev != nil {
+				_ = rootPrev.DecRef()
+			}
+
 			foundRoot = true
 		}
 		return nil
@@ -690,7 +787,7 @@ func (s *Scorch) removeOldBoltSnapshots() (numRemoved int, err error) {
 	s.eligibleForRemoval = newEligible
 	s.rootLock.Unlock()
 
-	if len(epochsToRemove) <= 0 {
+	if len(epochsToRemove) == 0 {
 		return 0, nil
 	}
 
